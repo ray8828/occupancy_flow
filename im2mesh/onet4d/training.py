@@ -4,6 +4,7 @@ from torch.nn import functional as F
 from im2mesh.common import compute_iou
 from torch import distributions as dist
 from im2mesh.training import BaseTrainer
+import time
 
 
 class Trainer(BaseTrainer):

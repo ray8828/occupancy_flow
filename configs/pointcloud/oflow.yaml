@@ -10,3 +10,4 @@ model:
 training:
   out_dir:  out/pointcloud/oflow
   n_eval_points: 10000
+  batch_size: 512

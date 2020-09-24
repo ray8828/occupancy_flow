@@ -8,19 +8,23 @@ import os
 import argparse
 import time
 
-
 # Arguments
 parser = argparse.ArgumentParser(
     description='Train a 4D model.'
 )
-parser.add_argument('config', type=str, help='Path to config file.')
+parser.add_argument('--config', type=str, help='Path to config file.')
 parser.add_argument('--no-cuda', action='store_true', help='Do not use cuda.')
+parser.add_argument('--gpu', '-g', type=str, default="0", help='cpu id')
 parser.add_argument('--exit-after', type=int, default=-1,
                     help='Checkpoint and exit after specified number of '
                          'seconds with exit code 2.')
 
 args = parser.parse_args()
 cfg = config.load_config(args.config, 'configs/default.yaml')
+
+print("Use GPU: {}".format(args.gpu))
+os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
+
 is_cuda = (torch.cuda.is_available() and not args.no_cuda)
 device = torch.device("cuda" if is_cuda else "cpu")
 
@@ -30,6 +34,7 @@ t0 = time.time()
 # Shorthands
 out_dir = cfg['training']['out_dir']
 batch_size = cfg['training']['batch_size']
+print("BatchSize Training {}".format(batch_size))
 batch_size_vis = cfg['training']['batch_size_vis']
 batch_size_val = cfg['training']['batch_size_val']
 backup_every = cfg['training']['backup_every']
@@ -55,11 +60,11 @@ val_dataset = config.get_dataset('val', cfg)
 
 # Dataloader
 train_loader = torch.utils.data.DataLoader(
-    train_dataset, batch_size=batch_size, num_workers=4, shuffle=True,
+    train_dataset, batch_size=batch_size, num_workers=8, shuffle=True,
     collate_fn=data.collate_remove_none,
     worker_init_fn=data.worker_init_fn)
 val_loader = torch.utils.data.DataLoader(
-    val_dataset, batch_size=batch_size_val, num_workers=4, shuffle=False,
+    val_dataset, batch_size=batch_size_val, num_workers=8, shuffle=False,
     collate_fn=data.collate_remove_none,
     worker_init_fn=data.worker_init_fn)
 
@@ -111,7 +116,7 @@ visualize_every = cfg['training']['visualize_every']
 
 # Print model
 nparameters = sum(p.numel() for p in model.parameters())
-print(model)
+# print(model)
 print('Total number of parameters: %d' % nparameters)
 
 # Training loop

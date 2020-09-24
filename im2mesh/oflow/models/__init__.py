@@ -4,6 +4,8 @@ from torch import distributions as dist
 from im2mesh.oflow.models import (
     encoder_latent, decoder, velocity_field)
 from im2mesh.utils.torchdiffeq.torchdiffeq import odeint, odeint_adjoint
+from torch.nn import functional as F
+from torch import distributions as dist
 
 encoder_latent_dict = {
     'simple': encoder_latent.Encoder,
@@ -47,7 +49,7 @@ class OccupancyFlow(nn.Module):
     '''
 
     def __init__(
-        self, decoder, encoder=None, encoder_latent=None,
+            self, decoder, encoder=None, encoder_latent=None,
             encoder_latent_temporal=None,
             encoder_temporal=None, vector_field=None,
             ode_step_size=None, use_adjoint=False,
@@ -81,23 +83,168 @@ class OccupancyFlow(nn.Module):
         if ode_step_size:
             self.ode_options['step_size'] = ode_step_size
 
-    def forward(self, p, time_val, inputs, sample=True):
-        ''' Makes a forward pass through the network.
+    # Origin
+    # def forward(self, p, time_val, inputs, sample=True):
+    #     ''' Makes a forward pass through the network.
+    #
+    #     Args:
+    #         p (tensor): points tensor
+    #         time_val (tensor): time values
+    #         inputs (tensor): input tensor
+    #         sample (bool): whether to sample
+    #     '''
+    #     batch_size = p.size(0)
+    #
+    #     c_s, c_t = self.encode_inputs(inputs)
+    #     z, z_t = self.get_z_from_prior((batch_size,), sample=sample)
+    #
+    #     p_t_at_t0 = self.model.transform_to_t0(time_val, p, c_t=c_t, z=z_t)
+    #     out = self.model.decode(p_t_at_t0, c=c_s, z=z)
+    #     return out
+
+    # new forward
+    def compute_kl(self, q_z):
+        ''' Compute the KL-divergence for predicted and prior distribution.
 
         Args:
-            p (tensor): points tensor
-            time_val (tensor): time values
-            inputs (tensor): input tensor
-            sample (bool): whether to sample
+            q_z (dist): predicted distribution
         '''
-        batch_size = p.size(0)
-        
-        c_s, c_t = self.encode_inputs(inputs)
-        z, z_t = self.get_z_from_prior((batch_size,), sample=sample)
+        if q_z.mean.shape[-1] != 0:
+            loss_kl = self.vae_beta * dist.kl_divergence(
+                q_z, self.model.module.p0_z).mean()
+            if torch.isnan(loss_kl):
+                loss_kl = torch.tensor([0.]).to(self.device)
+        else:
+            loss_kl = torch.tensor([0.]).to(self.device)
+        return loss_kl
 
-        p_t_at_t0 = self.model.transform_to_t0(time_val, p, c_t=c_t, z=z_t)
-        out = self.model.decode(p_t_at_t0, c=c_s, z=z)
-        return out
+    def get_loss_recon(self, data, c_s=None, c_t=None, z=None, z_t=None):
+        ''' Computes the reconstruction loss.
+
+        Args:
+            data (dict): data dictionary
+            c_s (tensor): spatial conditioned code
+            c_t (tensor): temporal conditioned code
+            z (tensor): latent code
+            z_t (tensor): latent temporal code
+        '''
+
+        loss_t0 = self.get_loss_recon_t0(data, c_s, z)
+        loss_t = self.get_loss_recon_t(data, c_s, c_t, z, z_t)
+
+        return loss_t0 + loss_t
+
+    def get_loss_recon_t0(self, data, c_s=None, z=None):
+        ''' Computes the reconstruction loss for time step t=0.
+
+        Args:
+            data (dict): data dictionary
+            c_s (tensor): spatial conditioned code c_s
+            z (tensor): latent code z
+        '''
+        p_t0 = data.get('points')
+        occ_t0 = data.get('points.occ')
+
+        device = self.device
+        batch_size = p_t0.shape[0]
+
+        logits_t0 = self.decode(p_t0.to(device), c=c_s, z=z).logits
+        loss_occ_t0 = F.binary_cross_entropy_with_logits(
+            logits_t0, occ_t0.view(batch_size, -1).to(device),
+            reduction='none')
+        loss_occ_t0 = loss_occ_t0.mean()
+
+        return loss_occ_t0
+
+    def get_loss_recon_t(self, data, c_s=None, c_t=None, z=None, z_t=None):
+        ''' Returns the reconstruction loss for time step t>0.
+
+        Args:
+            data (dict): data dictionary
+            c_s (tensor): spatial conditioned code c_s
+            c_t (tensor): temporal conditioned code c_s
+            z (tensor): latent code z
+            z_t (tensor): latent temporal code z
+        '''
+        device = self.device
+
+        p_t = data.get('points_t').to(device)
+        occ_t = data.get('points_t.occ').to(device)
+        time_val = data.get('points_t.time').to(device)
+        batch_size, n_pts, p_dim = p_t.shape
+
+        p_t_at_t0 = self.transform_to_t0(
+            time_val, p_t, c_t=c_t, z=z_t)
+        logits_p_t = self.decode(p_t_at_t0, c=c_s, z=z).logits
+
+        loss_occ_t = F.binary_cross_entropy_with_logits(
+            logits_p_t, occ_t.view(batch_size, -1), reduction='none')
+        loss_occ_t = loss_occ_t.mean()
+
+        return loss_occ_t
+
+    def compute_loss_corr(self, data, c_t=None, z_t=None):
+        ''' Returns the correspondence loss.
+
+        Args:
+            data (dict): data dictionary
+            c_t (tensor): temporal conditioned code c_s
+            z_t (tensor): latent temporal code z
+        '''
+
+        device = self.device
+        # Load point cloud data which are provided in equally spaced time
+        # steps between 0 and 1
+        pc = data.get('pointcloud').to(device)
+        length_sequence = pc.shape[1]
+        t = (torch.arange(
+            length_sequence, dtype=torch.float32) / (length_sequence - 1)
+             ).to(device)
+
+        if self.loss_corr_bw:
+            # Use forward and backward prediction
+            pred_f = self.model.module.transform_to_t(t, pc[:, 0], c_t=c_t, z=z_t)
+
+            pred_b = self.model.module.transform_to_t_backward(
+                t, pc[:, -1], c_t=c_t, z=z_t)
+            pred_b = pred_b.flip(1)
+
+            lc1 = torch.norm(pred_f - pc, 2, dim=-1).mean()
+            lc2 = torch.norm(pred_b - pc, 2, dim=-1).mean()
+            loss_corr = lc1 + lc2
+        else:
+            pt_pred = self.model.module.transform_to_t(
+                t[1:], pc[:, 0], c_t=c_t, z=z_t)
+            loss_corr = torch.norm(pt_pred - pc[:, 1:], 2, dim=-1).mean()
+
+        return loss_corr
+
+    def forward(self, data, loss_recon_flag, loss_corr_flag):
+        device = self.device
+        inputs = data.get('inputs', torch.empty(1, 1, 0)).to(device)
+        c_s, c_t = self.encode_inputs(inputs)
+        q_z, q_z_t = self.infer_z(inputs, c=c_t, data=data)
+        z, z_t = q_z.rsample(), q_z_t.rsample()
+
+        # Losses
+        # KL-divergence
+        loss_kl = self.compute_kl(q_z) + self.compute_kl(q_z_t)
+
+        # Reconstruction Loss
+        if loss_recon_flag:
+            loss_recon = self.get_loss_recon(data, c_s, c_t, z, z_t)
+        else:
+            loss_recon = 0
+
+        # Correspondence Loss
+        if loss_corr_flag:
+            loss_corr = self.compute_loss_corr(data, c_t, z_t, loss_corr_flag)
+        else:
+            loss_corr = 0
+
+        loss = loss_recon + loss_corr + loss_kl
+
+        return loss
 
     def decode(self, p, z=None, c=None, **kwargs):
         ''' Returns occupancy values for the points p at time step 0.
@@ -398,12 +545,12 @@ class OccupancyFlow(nn.Module):
         batch_size = p.shape[0]
         p_out = p.contiguous().view(batch_size, -1)
         if c is not None and c.shape[-1] != 0:
-            assert(c.shape[0] == batch_size)
+            assert (c.shape[0] == batch_size)
             c = c.contiguous().view(batch_size, -1)
             p_out = torch.cat([p_out, c], dim=-1)
 
         if z is not None and z.shape[-1] != 0:
-            assert(z.shape[0] == batch_size)
+            assert (z.shape[0] == batch_size)
             z = z.contiguous().view(batch_size, -1)
             p_out = torch.cat([p_out, z], dim=-1)
 
